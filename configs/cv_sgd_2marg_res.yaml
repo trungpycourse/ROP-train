@@ -45,7 +45,7 @@ sampler:
 # Knowledge Distillation Configuration
 distillation:
   use_distillation: true
-  teacher_checkpoint: './seg_checkpoint/best.pt'
+  teacher_checkpoint: '/kaggle/input/models/judopy/seg-checkpoint/pytorch/default/1/best.pt'
   teacher_model_name: 'AttentionUNet'
   teacher_input_size: [512, 512]
   teacher_num_classes: 4  # Teacher was trained on segmentation with 4 classes (bg, artery, vein, crossing)
