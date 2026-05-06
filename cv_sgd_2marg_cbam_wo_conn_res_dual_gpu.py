@@ -72,7 +72,9 @@ def transform_source(source: str) -> str:
         label="inject unwrap_model() and _infer_device()",
     )
 
-    # PATCH 2: DataParallel wrap sau .to(device), output_device=1 để balance tải
+    # PATCH 2: DataParallel wrap sau .to(device)
+    # Dùng device_ids=[0,1] mặc định, gather về GPU 0 (cùng nơi labels và criterion)
+    # KHÔNG dùng output_device=1 vì labels.to(device) luôn trên GPU 0 → device mismatch
     source = _safe_replace(
         source,
         "    ).to(device)\n    \n    # Loss criterion",
@@ -82,8 +84,8 @@ def transform_source(source: str) -> str:
         "    _use_dual_gpu = os.environ.get('USE_DUAL_GPU', '1') == '1'\n"
         "    if _use_dual_gpu and torch.cuda.is_available() and torch.cuda.device_count() >= 2:\n"
         "        torch.cuda.empty_cache()\n"
-        "        model = torch.nn.DataParallel(model, device_ids=[0, 1], output_device=1)\n"
-        "        print(f'  \u2705 Dual-GPU enabled: {torch.cuda.device_count()} GPUs | gather \u2192 GPU 1')\n"
+        "        model = torch.nn.DataParallel(model, device_ids=[0, 1])\n"
+        "        print(f'  \u2705 Dual-GPU enabled: {torch.cuda.device_count()} GPUs | gather \u2192 GPU 0')\n"
         "    elif _use_dual_gpu:\n"
         "        print(f'  \u26a0\ufe0f  Dual-GPU y\u00eau c\u1ea7u nh\u01b0ng ch\u1ec9 c\u00f3 {torch.cuda.device_count()} GPU(s), b\u1ecf qua.')\n"
         "    # --- end Dual-GPU ---\n"
@@ -199,7 +201,7 @@ def _validate_patched_source(source: str) -> None:
     checks = {
         "unwrap_model defined":              "def unwrap_model(m):" in source,
         "_infer_device defined":             "def _infer_device(" in source,
-        "DataParallel with output_device=1": "output_device=1" in source,
+        "DataParallel wrap present":          "torch.nn.DataParallel(model, device_ids=[0, 1])" in source,
         "autocast train loop fixed":         "autocast(device_type='cuda', dtype=torch.float16" in source,
         "get_embedding unwrapped":           "unwrap_model(model).get_embedding" in source,
         "forward_features unwrapped":        "unwrap_model(model).forward_features" in source,
@@ -247,7 +249,7 @@ def main() -> None:
             p = torch.cuda.get_device_properties(i)
             print(f"  GPU {i}      : {p.name} ({p.total_memory/1024**3:.1f} GB)")
         if use_dual_gpu and n_gpu >= 2:
-            print("  Phân bổ    : student → GPU 0+1 | teacher → GPU 0 | gather → GPU 1")
+            print("  Phân bổ    : student → GPU 0+1 | gather + criterion → GPU 0")
     print("=" * 60)
 
     print("\n[Bước 1] Áp dụng patches...")
