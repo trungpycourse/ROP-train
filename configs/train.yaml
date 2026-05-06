@@ -1,0 +1,69 @@
+### General Settings
+debug: false                # If true, disables WandB logging and runs in debug mode (e.g., for quick testing without full logging)
+mode: train                 # Training mode; currently only 'train' is supported (enforced in train.py)
+train_fold: 5               # Number of folds for K-fold cross-validation (e.g., 5-fold CV)
+project_name: 'Classification-Plus'  # Name of the WandB project for logging experiments
+saved_model_directory: 'model_ckpts'  # Directory to save model checkpoints and configs
+log_interval: 100           # Interval (in batches) to log training metrics to console/WandB
+save_interval: 1            # Interval (in epochs) to save model checkpoints
+
+### Hardware and Runtime Settings
+cuda: true                  # Enable CUDA (GPU) if available; falls back to CPU otherwise
+CUDA_VISIBLE_DEVICES: '0'   # Specifies which GPUs to use (e.g., '0' for first GPU)
+pin_memory: true            # Enables pinned memory for faster data transfer to GPU (recommended for CUDA)
+worker: 0                   # Number of worker processes for data loading (0 = main thread; increase for faster loading but watch memory)
+wandb: true                 # Enable Weights & Biases logging for metrics, plots, and experiments
+
+### Model Configuration
+model_name: 'CLS_ResNet'    # Name of the wrapper class from wrappers.py (e.g., 'CLS_ResNet' for ResNet-specific handling; must match a class in wrappers.py)
+timm_model_name: 'resnet18' # Underlying TIMM model variant (e.g., 'resnet18', 'vit_base_patch16_224'; list via timm.list_models())
+pretrained: true            # Load pretrained weights from TIMM (useful for transfer learning)
+dropout_rate: 0.2           # Dropout rate applied before the final classifier head (0.0 = no dropout)
+custom_head_layers:         # Optional list to customize the top/head layers (e.g., add extra Linear, ReLU, Dropout); passed to wrapper's _build_custom_head
+  - {type: 'Linear', out: 1024}
+  - {type: 'ReLU'}
+  - {type: 'Dropout', p: 0.3}
+freeze_stages: [0,1]        # List of stages/layers to freeze for transfer learning (architecture-specific; e.g., [0,1] freezes early ResNet conv/layer1)
+n_classes: 3                # Number of output classes for classification
+in_channels: 3              # Number of input channels (e.g., 3 for RGB)
+input_space: 'RGB'          # Input color space ('RGB' or 'GR' for gray+red; affects transforms in dataloader_cv.py)
+input_channel: 3            # Redundant with in_channels; specifies input channels (typically 3 for RGB)
+input_size: [224, 224]      # Target image size for resizing/padding (height, width)
+
+### Optimizer and Scheduler
+optimizer:
+  name: 'AdamW'             # Optimizer name (e.g., 'AdamW'; from lr_schedulers.py)
+  lr: 0.001                 # Initial learning rate
+  scheduler: 'WarmupCosine' # LR scheduler type (e.g., 'WarmupCosine', 'CosineAnnealingLR'; from lr_schedulers.py)
+  cycles: 50                # Number of cycles for cosine annealing (if applicable)
+  warmup_epoch: 10          # Number of warmup epochs for gradual LR increase
+  weight_decay: 0.01        # Weight decay for regularization
+
+### Training Hyperparameters
+criterion: 'ce'             # Loss function (e.g., 'ce' for CrossEntropy; from losses.py; options like 'focal', 'dice')
+task: 'cls'                 # Task type; currently only 'cls' (classification) is supported
+batch_size: 32              # Batch size for training/validation
+epoch: 10                  # Total number of training epochs
+
+### Data Loading and Dataset
+dataloader: 'ImageClassification_resize'  # Data loader type (e.g., 'ImageClassification_resize' or '_zero_pad'; from dataloader_cv.py)
+csv_path: './datasets/FaRFUM-RoP_crop/training_5_folds_stratified.csv'  # Path to CSV with image paths, labels, and folds
+dataset_root: './datasets/FaRFUM-RoP_crop/'  # Root directory for dataset images
+class_names: ['normal', 'preplus', 'plus']  # List of class names for metrics and logging (must match n_classes)
+
+### Augmentation Parameters
+transform_blur: true        # Apply random Gaussian blur
+transform_jitter: true      # Apply color jitter (brightness, contrast, etc.)
+transform_hflip: true       # Apply random horizontal flip
+transform_vflip: true       # Apply random vertical flip
+transform_perspective: true # Apply random perspective transform
+transform_rotation: true    # Apply random rotation
+rotation_degrees: 30        # Max degrees for rotation (±30)
+transform_clahe: true       # Apply CLAHE for contrast enhancement (from preprocessing.py)
+
+### Advanced/Optional Parameters
+ema_decay: 0                # Decay rate for Exponential Moving Average (EMA) model (0 = disabled)
+class_weight: null          # Class weights for weighted loss (null = equal; list for custom weights)
+model_path: ''              # Path to pre-load a model checkpoint (empty = start from scratch)
+freeze_layer: false         # Global flag to freeze layers (use freeze_stages for more control)
+use_sampler: false          # Use weighted sampler for imbalanced data (from dataloader_cv.py)

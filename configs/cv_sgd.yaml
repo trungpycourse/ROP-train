@@ -1,0 +1,79 @@
+# Configuration for train_prototype_plus.py
+# ResNet50 Classification Training Configuration
+
+# Data Configuration
+data:
+  data_dir: './datasets/FaRFUM-RoP_crop'
+  csv_path: './datasets/FaRFUM-RoP_crop/training_5_folds_stratified.csv'
+  input_size: [512, 512]
+  n_folds: 5
+
+# Training Configuration
+training:
+  batch_size: 8  # Using 2-layer distillation (enc2+enc3 only, skipping enc1 for memory)
+  epochs: 100
+  lr: 0.0003
+  momentum: 0.9
+  weight_decay: 0.0001
+  num_workers: 0
+  pin_memory: true
+  prefetch_factor: 2
+  use_amp: true
+  # use_cache: false
+  # LR Scheduler Configuration
+  use_scheduler: true  # Enable learning rate scheduling
+  scheduler_type: 'cosine'  # Options: 'cosine' (CosineAnnealingLR), 'step', 'none'
+  scheduler_t_max: 100  # For cosine: number of epochs for one cycle (usually same as epochs)
+  scheduler_eta_min: 0.00001  # For cosine: minimum learning rate
+
+# Model Configuration
+model:
+  model_name: 'resnet50'  # Options: 'resnet50', 'efficientnet_b0'
+  dropout_rate: 0.3
+  freeze_backbone: false
+  custom_head: [512]  # e.g., [512, 256] for custom head, null for simple head
+  num_classes: 3
+
+# Loss Configuration
+loss:
+  loss_type: 'ce'  # Options: 'ce' (CrossEntropy), 'weighted_ce', 'focal'
+
+# Sampler Configuration
+sampler:
+  sampler_type: 'weighted_random'  # Options: 'none', 'weighted_random', 'balanced_batch'
+
+# Knowledge Distillation Configuration
+distillation:
+  use_distillation: true
+  teacher_checkpoint: '../AV-seg/model_ckpts/FAV-AttentionUNet/best.pt'
+  teacher_model_name: 'AttentionUNet'
+  teacher_input_size: [512, 512]
+  teacher_num_classes: 4  # Teacher was trained on segmentation with 4 classes (bg, artery, vein, crossing)
+  start_epoch: 0  # Start distillation from epoch N (0-indexed). Epochs 0-1 warmup, 2+ distillation
+  use_fundus_mask: true  # Apply fundus region mask to filter corner/background attention
+
+
+# Ordinal Learning Configuration
+ordinal:
+  use_ordinal_loss: true
+  ordinal_margin: 0.5  # Margin for triplet loss (0.5-1.0 for CosineSimilarity, 1.0-2.0 for Euclidean)
+  ordinal_mining_strategy: 'semihard'  # Options: 'hard', 'semihard' (recommended), 'all'
+  verbose: false  # Print distance statistics for margin tuning (set false after tuning)
+  print_freq: 100  # Print stats every N batches (lower = more frequent)
+  # Note: Requires batch_size >= 18 (3 classes × 6 samples/class minimum)
+  # Increase batch_size if seeing invalid triplets (anchor==negative)
+
+# Loss Weighting Configuration
+loss_weights:
+  lambda1: 0.7  # Weight for classification loss
+  lambda2: 0.3  # Weight for ordinal triplet loss
+  lambda3: 5.0  # Weight for distillation loss
+
+# Cross Validation Configuration
+cross_validation:
+  use_cross_validation: true
+
+# Logging Configuration
+logging:
+  run_name: 'resnet50_sgd'  # Will be appended with run_id
+  log_dir: './runs'
