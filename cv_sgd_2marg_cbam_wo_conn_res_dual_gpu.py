@@ -3,6 +3,13 @@
 Áp dụng DataParallel tại runtime bằng cách patch source in-memory.
 File gốc KHÔNG bị thay đổi.
 
+Fix OOM so với phiên bản trước:
+  - autocast dùng 'cuda' literal + dtype=float16 → propagate đúng sang cả 2 replicas
+  - distillation_loss dùng _infer_device() thay vì biến global `device` (cuda:0)
+  - output_device=1 → gather về GPU 1, giảm tải GPU 0 (nơi teacher chạy)
+  - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True → giảm OOM do fragmentation
+  - Giữ nguyên: unwrap_model, state_dict patches từ phiên bản trước
+
 Cách dùng:
     python cv_sgd_2marg_cbam_wo_conn_res_dual_gpu.py
 
@@ -22,44 +29,26 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 TARGET_SCRIPT = SCRIPT_DIR / "cv_sgd_2marg_cbam_wo_conn_res.py"
 
 
-# ---------------------------------------------------------------------------
-# Helper: safe replace — báo lỗi rõ ràng nếu patch không tìm thấy target
-# ---------------------------------------------------------------------------
-
 def _safe_replace(source: str, old: str, new: str, label: str) -> str:
-    """Replace old→new trong source, raise lỗi nếu không tìm thấy đúng 1 lần."""
     count = source.count(old)
     if count == 0:
         raise RuntimeError(
             f"\n[Patch THẤT BẠI] '{label}'\n"
-            f"  Không tìm thấy target string trong file gốc.\n"
-            f"  File gốc có thể đã thay đổi. Cần cập nhật patch.\n"
-            f"  Target (60 ký tự đầu): {old[:60]!r}"
+            f"  Không tìm thấy target string. File gốc có thể đã thay đổi.\n"
+            f"  Target (80 ký tự đầu): {old[:80]!r}"
         )
     if count > 1:
         raise RuntimeError(
             f"\n[Patch THẤT BẠI] '{label}'\n"
             f"  Tìm thấy {count} lần (cần đúng 1).\n"
-            f"  Patch có thể gây ra thay đổi ngoài ý muốn.\n"
-            f"  Target (60 ký tự đầu): {old[:60]!r}"
+            f"  Target (80 ký tự đầu): {old[:80]!r}"
         )
     return source.replace(old, new, 1)
 
 
-# ---------------------------------------------------------------------------
-# Tất cả các patches
-# ---------------------------------------------------------------------------
-
 def transform_source(source: str) -> str:
-    """
-    Áp dụng tối thiểu các patch cần thiết để hỗ trợ nn.DataParallel.
-    Thứ tự patch quan trọng: unwrap_model phải được inject trước khi dùng.
-    """
 
-    # ------------------------------------------------------------------
-    # PATCH 1: Inject hàm unwrap_model() vào trước generate_fundus_mask_batch
-    # Mục đích: dùng để gọi custom methods và lưu state_dict đúng
-    # ------------------------------------------------------------------
+    # PATCH 1: Inject unwrap_model() và _infer_device()
     source = _safe_replace(
         source,
         "\n\ndef generate_fundus_mask_batch",
@@ -68,14 +57,22 @@ def transform_source(source: str) -> str:
         "    \"\"\"Trả về module gốc, bỏ qua DataParallel wrapper nếu có.\"\"\"\n"
         "    return m.module if isinstance(m, torch.nn.DataParallel) else m\n"
         "\n\n"
+        "def _infer_device(*tensors):\n"
+        "    \"\"\"Suy device từ tensor đầu tiên — an toàn với DataParallel replicas.\"\"\"\n"
+        "    for t in tensors:\n"
+        "        if isinstance(t, torch.Tensor):\n"
+        "            return t.device\n"
+        "        if isinstance(t, dict):\n"
+        "            for v in t.values():\n"
+        "                if isinstance(v, torch.Tensor):\n"
+        "                    return v.device\n"
+        "    return torch.device('cuda')\n"
+        "\n\n"
         "def generate_fundus_mask_batch",
-        label="inject unwrap_model()",
+        label="inject unwrap_model() and _infer_device()",
     )
 
-    # ------------------------------------------------------------------
-    # PATCH 2: Wrap model bằng DataParallel ngay sau .to(device)
-    # Target chính xác: dòng 770-772 trong file gốc
-    # ------------------------------------------------------------------
+    # PATCH 2: DataParallel wrap sau .to(device), output_device=1 để balance tải
     source = _safe_replace(
         source,
         "    ).to(device)\n    \n    # Loss criterion",
@@ -84,20 +81,54 @@ def transform_source(source: str) -> str:
         "    # --- Dual-GPU: DataParallel wrapper ---\n"
         "    _use_dual_gpu = os.environ.get('USE_DUAL_GPU', '1') == '1'\n"
         "    if _use_dual_gpu and torch.cuda.is_available() and torch.cuda.device_count() >= 2:\n"
-        "        model = torch.nn.DataParallel(model)\n"
-        "        print(f\"  ✅ Dual-GPU enabled: {torch.cuda.device_count()} GPUs\")\n"
+        "        torch.cuda.empty_cache()\n"
+        "        model = torch.nn.DataParallel(model, device_ids=[0, 1], output_device=1)\n"
+        "        print(f'  \u2705 Dual-GPU enabled: {torch.cuda.device_count()} GPUs | gather \u2192 GPU 1')\n"
         "    elif _use_dual_gpu:\n"
-        "        print(f\"  ⚠️  Dual-GPU yêu cầu nhưng chỉ có {torch.cuda.device_count()} GPU(s), bỏ qua.\")\n"
+        "        print(f'  \u26a0\ufe0f  Dual-GPU y\u00eau c\u1ea7u nh\u01b0ng ch\u1ec9 c\u00f3 {torch.cuda.device_count()} GPU(s), b\u1ecf qua.')\n"
         "    # --- end Dual-GPU ---\n"
         "\n"
         "    # Loss criterion",
         label="DataParallel wrap after .to(device)",
     )
 
-    # ------------------------------------------------------------------
-    # PATCH 3: model.get_embedding() — cần unwrap để gọi custom method
-    # Dòng 1021 trong file gốc
-    # ------------------------------------------------------------------
+    # PATCH 3a: Fix autocast trong training loop
+    source = _safe_replace(
+        source,
+        "            with autocast(device_type=device.type, enabled=config['training']['use_amp']):\n"
+        "                outputs = model(inputs)\n"
+        "                ce_loss = criterion(outputs, labels)",
+        "            with autocast(device_type='cuda', dtype=torch.float16, enabled=config['training']['use_amp']):\n"
+        "                outputs = model(inputs)\n"
+        "                ce_loss = criterion(outputs, labels)",
+        label="fix autocast training loop",
+    )
+
+    # PATCH 3b: Fix autocast trong validation loop
+    source = _safe_replace(
+        source,
+        "                with autocast(device_type=device.type, enabled=config['training']['use_amp']):\n",
+        "                with autocast(device_type='cuda', dtype=torch.float16, enabled=config['training']['use_amp']):\n",
+        label="fix autocast validation loop",
+    )
+
+    # PATCH 4: distillation_loss dùng _infer_device thay vì biến global device
+    source = _safe_replace(
+        source,
+        "                    distill_loss = distillation_loss_encoder_decoder_fusion(\n"
+        "                        student_features_dict, teacher_features,\n"
+        "                        student_connectors, teacher_connectors,\n"
+        "                        teacher_cbam_modules, student_cbam_modules,\n"
+        "                        layer_mapping, device, fundus_masks,",
+        "                    distill_loss = distillation_loss_encoder_decoder_fusion(\n"
+        "                        student_features_dict, teacher_features,\n"
+        "                        student_connectors, teacher_connectors,\n"
+        "                        teacher_cbam_modules, student_cbam_modules,\n"
+        "                        layer_mapping, _infer_device(student_features_dict), fundus_masks,",
+        label="distillation_loss: _infer_device instead of global device",
+    )
+
+    # PATCH 5: unwrap get_embedding
     source = _safe_replace(
         source,
         "                    embeddings = model.get_embedding(inputs)",
@@ -105,10 +136,7 @@ def transform_source(source: str) -> str:
         label="unwrap model.get_embedding()",
     )
 
-    # ------------------------------------------------------------------
-    # PATCH 4: model.forward_features() — cần unwrap để gọi custom method
-    # Dòng 1029 trong file gốc
-    # ------------------------------------------------------------------
+    # PATCH 6: unwrap forward_features
     source = _safe_replace(
         source,
         "                    student_features_dict = model.forward_features(inputs, return_dict=True)",
@@ -116,12 +144,7 @@ def transform_source(source: str) -> str:
         label="unwrap model.forward_features()",
     )
 
-    # ------------------------------------------------------------------
-    # PATCH 5: teacher_model.extract_features() — unwrap phòng trường hợp
-    # teacher được wrap về sau; hiện tại teacher không dùng DataParallel
-    # nhưng unwrap_model() an toàn khi không được wrap (trả về chính nó)
-    # Dòng 1034 trong file gốc
-    # ------------------------------------------------------------------
+    # PATCH 7: unwrap extract_features
     source = _safe_replace(
         source,
         "                            _, teacher_features = teacher_model.extract_features(inputs)",
@@ -129,10 +152,7 @@ def transform_source(source: str) -> str:
         label="unwrap teacher_model.extract_features()",
     )
 
-    # ------------------------------------------------------------------
-    # PATCH 6: Lưu state_dict đúng cho best.pt
-    # Dòng 1192 trong file gốc — bên trong block `if val_f1 > best_val_f1`
-    # ------------------------------------------------------------------
+    # PATCH 8: state_dict best.pt
     source = _safe_replace(
         source,
         "            torch.save({\n"
@@ -149,13 +169,10 @@ def transform_source(source: str) -> str:
         "                'val_f1': val_f1,\n"
         "                'val_auc': val_auc\n"
         "            }, ckpt_dir / 'best.pt')",
-        label="unwrap model.state_dict() in best.pt",
+        label="unwrap state_dict → best.pt",
     )
 
-    # ------------------------------------------------------------------
-    # PATCH 7: Lưu state_dict đúng cho last.pt
-    # Dòng 1206 trong file gốc — sau vòng lặp epoch
-    # ------------------------------------------------------------------
+    # PATCH 9: state_dict last.pt
     source = _safe_replace(
         source,
         "    torch.save({\n"
@@ -172,69 +189,46 @@ def transform_source(source: str) -> str:
         "        'val_f1': val_f1,\n"
         "        'val_auc': val_auc\n"
         "    }, ckpt_dir / 'last.pt')",
-        label="unwrap model.state_dict() in last.pt",
+        label="unwrap state_dict → last.pt",
     )
 
     return source
 
 
-# ---------------------------------------------------------------------------
-# Kiểm tra batch_size hợp lệ cho DataParallel
-# ---------------------------------------------------------------------------
-
-def _check_batch_size_for_dual_gpu(source: str) -> None:
-    """
-    Cảnh báo nếu batch_size trong config có thể không chia hết cho 2 GPU.
-    Chỉ warn, không raise — vì batch_size đến từ YAML config runtime.
-    """
-    # Không thể đọc YAML ở đây vì chưa chạy script, nên chỉ nhắc nhở.
-    print(
-        "  ℹ️  Lưu ý: DataParallel yêu cầu batch_size chia hết cho số GPU (2).\n"
-        "      Kiểm tra config 'training.batch_size' trước khi training."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Validate: đảm bảo tất cả patches đã được áp dụng thành công
-# ---------------------------------------------------------------------------
-
 def _validate_patched_source(source: str) -> None:
-    """Kiểm tra các dấu hiệu cho thấy patch đã thành công."""
     checks = {
-        "unwrap_model defined":          "def unwrap_model(m):" in source,
-        "DataParallel wrap present":     "torch.nn.DataParallel(model)" in source,
-        "get_embedding unwrapped":       "unwrap_model(model).get_embedding" in source,
-        "forward_features unwrapped":    "unwrap_model(model).forward_features" in source,
-        "extract_features unwrapped":    "unwrap_model(teacher_model).extract_features" in source,
-        "best.pt state_dict unwrapped":  source.count("unwrap_model(model).state_dict()") >= 1,
-        "last.pt state_dict unwrapped":  source.count("unwrap_model(model).state_dict()") >= 2,
-        "no bare model.state_dict()":    "model.state_dict()" not in source,
+        "unwrap_model defined":              "def unwrap_model(m):" in source,
+        "_infer_device defined":             "def _infer_device(" in source,
+        "DataParallel with output_device=1": "output_device=1" in source,
+        "autocast train loop fixed":         "autocast(device_type='cuda', dtype=torch.float16" in source,
+        "get_embedding unwrapped":           "unwrap_model(model).get_embedding" in source,
+        "forward_features unwrapped":        "unwrap_model(model).forward_features" in source,
+        "extract_features unwrapped":        "unwrap_model(teacher_model).extract_features" in source,
+        "distill uses _infer_device":        "_infer_device(student_features_dict)" in source,
+        "best.pt unwrapped":                 source.count("unwrap_model(model).state_dict()") >= 1,
+        "last.pt unwrapped":                 source.count("unwrap_model(model).state_dict()") >= 2,
+        "no bare model.state_dict()":        "model.state_dict()" not in source,
     }
-
     failed = [name for name, ok in checks.items() if not ok]
     if failed:
         raise RuntimeError(
-            f"\n[Validation THẤT BẠI] Các patch sau không được áp dụng:\n"
-            + "\n".join(f"  ✗ {name}" for name in failed)
+            "\n[Validation THẤT BẠI] Patches chưa được áp dụng:\n"
+            + "\n".join(f"  ✗ {n}" for n in failed)
         )
-
-    print("  ✅ Tất cả patches đã được xác nhận thành công:")
+    print("  ✅ Tất cả patches xác nhận thành công:")
     for name in checks:
         print(f"     ✓ {name}")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    # Kiểm tra file gốc tồn tại
     if not TARGET_SCRIPT.exists():
         sys.exit(
-            f"[Lỗi] Không tìm thấy file gốc:\n  {TARGET_SCRIPT}\n"
-            f"Đảm bảo file này nằm cùng thư mục với launcher."
+            f"[Lỗi] Không tìm thấy:\n  {TARGET_SCRIPT}\n"
+            f"Đảm bảo file gốc nằm cùng thư mục."
         )
 
+    # Fix OOM fragmentation — gợi ý từ PyTorch OOM error message
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("USE_DUAL_GPU", "1")
     os.chdir(SCRIPT_DIR)
 
@@ -243,46 +237,37 @@ def main() -> None:
     print("=" * 60)
     print("Dual-GPU Launcher")
     print("=" * 60)
-    print(f"  File gốc  : {TARGET_SCRIPT}")
-    print(f"  Dual GPU  : {'BẬT' if use_dual_gpu else 'TẮT (USE_DUAL_GPU=0)'}")
-    if use_dual_gpu:
-        n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        print(f"  CUDA GPUs : {n_gpu}")
-        if n_gpu >= 2:
-            for i in range(n_gpu):
-                props = torch.cuda.get_device_properties(i)
-                vram = props.total_memory / 1024**3
-                print(f"    GPU {i}: {props.name} ({vram:.1f} GB VRAM)")
+    print(f"  File gốc   : {TARGET_SCRIPT.name}")
+    print(f"  Dual GPU   : {'BẬT' if use_dual_gpu else 'TẮT'}")
+    print(f"  ALLOC_CONF : {os.environ['PYTORCH_CUDA_ALLOC_CONF']}")
+
+    if torch.cuda.is_available():
+        n_gpu = torch.cuda.device_count()
+        for i in range(n_gpu):
+            p = torch.cuda.get_device_properties(i)
+            print(f"  GPU {i}      : {p.name} ({p.total_memory/1024**3:.1f} GB)")
+        if use_dual_gpu and n_gpu >= 2:
+            print("  Phân bổ    : student → GPU 0+1 | teacher → GPU 0 | gather → GPU 1")
     print("=" * 60)
 
-    # Đọc và patch source
-    source = TARGET_SCRIPT.read_text(encoding="utf-8")
-
     print("\n[Bước 1] Áp dụng patches...")
-    patched_source = transform_source(source)
+    source = TARGET_SCRIPT.read_text(encoding="utf-8")
+    patched = transform_source(source)
 
     print("\n[Bước 2] Xác nhận patches...")
-    _validate_patched_source(patched_source)
-
-    if use_dual_gpu:
-        _check_batch_size_for_dual_gpu(patched_source)
+    _validate_patched_source(patched)
 
     print("\n[Bước 3] Khởi động training...\n")
     print("=" * 60)
 
-    # Compile và chạy patched source
-    globals_dict = {
+    code = compile(patched, str(TARGET_SCRIPT), "exec")
+    exec(code, {  # noqa: S102
         "__name__": "__main__",
         "__file__": str(TARGET_SCRIPT),
         "__package__": None,
         "__cached__": None,
-        # Inject torch vào namespace để unwrap_model() trong patched source
-        # có thể dùng torch.nn.DataParallel ngay khi được định nghĩa
         "torch": torch,
-    }
-
-    code = compile(patched_source, str(TARGET_SCRIPT), "exec")
-    exec(code, globals_dict)  # noqa: S102
+    })
 
 
 if __name__ == "__main__":
