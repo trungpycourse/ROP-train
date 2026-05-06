@@ -51,7 +51,8 @@ distillation:
   teacher_num_classes: 4  # Teacher was trained on segmentation with 4 classes (bg, artery, vein, crossing)
   start_epoch: 0  # Start distillation from epoch N (0-indexed). Epochs 0-1 warmup, 2+ distillation
   use_fundus_mask: true  # Apply fundus region mask to filter corner/background attention
-
+  qualitative_check: true  
+  qualitative_every_n_batches: 50
 
 # Ordinal Learning Configuration
 ordinal:
